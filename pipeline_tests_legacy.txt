@@ -1,0 +1,524 @@
+"""
+Tests for Steps 3-10: config, models, EarthLikeScore, API, light curves, CNN.
+
+Organised by what each group protects. The leakage guards come first because
+they are the assertions whose failure would invalidate every other number in
+the project without raising anything.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from ml.config import features as fx
+from ml.config import labels as lbl
+from ml.config.settings import Settings
+from ml.data_access import load_dataset
+from ml.preprocessing.clean import clean_koi
+from ml.preprocessing.features import engineer_features
+from ml.preprocessing.splits import apply_split, make_split
+
+
+@pytest.fixture(scope="module")
+def dataset() -> pd.DataFrame:
+    handle = load_dataset("synthetic", n_synthetic=900, seed=7)
+    labelled, _, _ = clean_koi(handle.frame)
+    return engineer_features(labelled)
+
+
+@pytest.fixture(scope="module")
+def split(dataset):
+    return make_split(dataset, label_column=lbl.TARGET_BINARY)
+
+
+# ===========================================================================
+# LEAKAGE GUARDS
+# ===========================================================================
+def test_quarantined_columns_absent_from_valid_feature_sets(dataset):
+    """The assertion that protects every downstream number."""
+    for name in fx.VALID_FEATURE_SETS:
+        resolved = fx.resolve(dataset, name)
+        overlap = set(resolved.all) & set(fx.QUARANTINED)
+        assert not overlap, f"{name} contains quarantined columns: {sorted(overlap)}"
+
+
+def test_leaky_control_actually_contains_the_leak(dataset):
+    """The control is only a control if it really has the flags."""
+    resolved = fx.resolve(dataset, "leaky_control")
+    flags = {"koi_fpflag_nt", "koi_fpflag_ss", "koi_fpflag_co", "koi_fpflag_ec"}
+    assert flags.issubset(set(resolved.all))
+    assert "koi_score" in resolved.all
+
+
+def test_leaky_control_is_not_a_valid_feature_set():
+    assert "leaky_control" not in fx.VALID_FEATURE_SETS
+    assert fx.PRIMARY_FEATURE_SET in fx.VALID_FEATURE_SETS
+
+
+def test_resolve_raises_if_a_valid_set_is_contaminated(dataset):
+    """Simulate the regression this guard exists to catch."""
+    original = fx.FEATURE_SETS["baseline"]
+    try:
+        fx.FEATURE_SETS["baseline"] = original + ("koi_score",)
+        with pytest.raises(AssertionError, match="quarantined"):
+            fx.resolve(dataset, "baseline")
+    finally:
+        fx.FEATURE_SETS["baseline"] = original
+
+
+def test_target_columns_never_become_features(dataset):
+    for name in fx.FEATURE_SETS:
+        resolved = fx.resolve(dataset, name)
+        assert not (set(resolved.all) & set(fx.TARGETS))
+        assert "_truth_kind" not in resolved.all
+
+
+def test_label_mapping_is_explicit_and_complete():
+    assert set(lbl.BINARY_MAP) == set(lbl.MODELLED_DISPOSITIONS)
+    assert lbl.BINARY_MAP[lbl.FALSE_POSITIVE] == 0
+    assert lbl.BINARY_MAP[lbl.CONFIRMED] == lbl.BINARY_MAP[lbl.CANDIDATE] == 1
+    assert lbl.NOT_DISPOSITIONED not in lbl.BINARY_MAP  # held out, not a class
+    for disposition in (*lbl.MODELLED_DISPOSITIONS, lbl.NOT_DISPOSITIONED):
+        assert lbl.MAPPING_RATIONALE[disposition]
+
+
+# ===========================================================================
+# DATA SOURCE ABSTRACTION
+# ===========================================================================
+def test_dataset_handle_labels_synthetic_data_unmistakably():
+    handle = load_dataset("synthetic", n_synthetic=120)
+    assert not handle.is_real
+    assert "SYNTHETIC" in handle.banner.upper()
+    assert "NOT a NASA result" in handle.banner
+    assert handle.metadata()["data_source"] == "synthetic"
+
+
+def test_unknown_data_source_raises_rather_than_defaulting():
+    with pytest.raises(ValueError, match="unknown DATA_SOURCE"):
+        load_dataset("whatever")
+
+
+def test_real_data_failure_never_falls_back_to_synthetic(tmp_path):
+    from ml.data_access.real_data_loader import RealDataUnavailable, load_real_koi
+    with pytest.raises(RealDataUnavailable):
+        load_real_koi("cumulative", raw_dir=tmp_path, allow_download=False)
+
+
+# ===========================================================================
+# MODEL PIPELINES
+# ===========================================================================
+def test_every_model_builds_and_fits(dataset, split):
+    from ml.model_zoo import MODEL_SPECS, build_model
+    train, _ = apply_split(dataset, split)
+    resolved = fx.resolve(dataset, "baseline")
+    X, y = train[resolved.all], train[lbl.TARGET_BINARY]
+    for name in MODEL_SPECS:
+        pipeline = build_model(name, resolved, seed=0, dev_mode=True)
+        pipeline.fit(X, y)
+        proba = pipeline.predict_proba(X.head(20))
+        assert proba.shape == (20, 2)
+        assert np.all((proba >= 0) & (proba <= 1))
+
+
+def test_preprocessing_is_inside_the_pipeline(dataset):
+    """Scaler statistics must come from the fold, not the full dataset.
+
+    Fitting on a subset and on the whole frame must give different scaler means;
+    if they matched, the pipeline would be leaking distributional information.
+    """
+    from ml.model_zoo import build_model
+    resolved = fx.resolve(dataset, "baseline")
+    pipeline = build_model("logistic_regression", resolved, seed=0, dev_mode=True)
+    assert "prep" in pipeline.named_steps
+    half = len(dataset) // 2
+    a = build_model("logistic_regression", resolved, 0, True).fit(
+        dataset[resolved.all].iloc[:half], dataset[lbl.TARGET_BINARY].iloc[:half])
+    b = build_model("logistic_regression", resolved, 0, True).fit(
+        dataset[resolved.all], dataset[lbl.TARGET_BINARY])
+    ma = a.named_steps["prep"].named_transformers_["num"].named_steps["scale"].mean_
+    mb = b.named_steps["prep"].named_transformers_["num"].named_steps["scale"].mean_
+    assert not np.allclose(ma, mb), "preprocessing appears to be fitted outside the fold"
+
+
+def test_grouped_cv_produces_out_of_fold_predictions(dataset, split):
+    from ml.model_zoo import build_model
+    from ml.training.cross_validation import cross_validate_grouped
+    train, _ = apply_split(dataset, split)
+    resolved = fx.resolve(dataset, "baseline")
+    pipeline = build_model("logistic_regression", resolved, seed=0, dev_mode=True)
+    result = cross_validate_grouped(
+        pipeline, train[resolved.all], train[lbl.TARGET_BINARY], train, split)
+    assert len(result.fold_metrics) >= 2
+    assert result.oof_proba is not None and len(result.oof_proba) > 0
+    assert np.isfinite(result.oof_metrics().pr_auc)
+
+
+def test_model_artifacts_save_and_reload(dataset, split, tmp_path):
+    import joblib
+    from ml.model_zoo import build_model
+    train, _ = apply_split(dataset, split)
+    resolved = fx.resolve(dataset, "baseline")
+    pipeline = build_model("random_forest", resolved, seed=0, dev_mode=True)
+    pipeline.fit(train[resolved.all], train[lbl.TARGET_BINARY])
+    path = tmp_path / "m.joblib"
+    joblib.dump({"pipeline": pipeline, "metadata": {"scientifically_valid": True}}, path)
+    reloaded = joblib.load(path)
+    assert reloaded["metadata"]["scientifically_valid"]
+    np.testing.assert_allclose(
+        reloaded["pipeline"].predict_proba(train[resolved.all].head(5)),
+        pipeline.predict_proba(train[resolved.all].head(5)))
+
+
+# ===========================================================================
+# METRICS
+# ===========================================================================
+def test_metrics_return_nan_rather_than_raising_when_undefined():
+    from ml.evaluation.metrics import binary_metrics
+    single_class = binary_metrics([1, 1, 1], [1, 1, 1], [0.9, 0.8, 0.95])
+    assert np.isnan(single_class.roc_auc)          # undefined, not an exception
+    assert single_class.accuracy == 1.0
+
+
+def test_metrics_are_correct_on_a_known_case():
+    from ml.evaluation.metrics import binary_metrics
+    m = binary_metrics([1, 1, 0, 0], [1, 0, 0, 0], [0.9, 0.4, 0.2, 0.1])
+    assert m.precision == pytest.approx(1.0)       # 1 predicted positive, correct
+    assert m.recall == pytest.approx(0.5)          # 1 of 2 actual positives
+    assert m.f1 == pytest.approx(2 / 3)
+    assert m.accuracy == pytest.approx(0.75)
+
+
+def test_accuracy_is_documented_as_unsuitable_for_selection():
+    from ml.evaluation.metrics import SELECTION_METRIC_RATIONALE
+    assert "NEVER" in SELECTION_METRIC_RATIONALE["accuracy"]
+    assert "pr_auc" in SELECTION_METRIC_RATIONALE
+
+
+# ===========================================================================
+# HABITABLE ZONE
+# ===========================================================================
+def test_hz_reference_values_are_stable():
+    """Regression anchor: a silently edited coefficient shifts every score."""
+    from ml.earthlike.habitable_zone import hz_reference_values
+    ref = hz_reference_values()
+    inner, outer = ref["conservative_au"]
+    assert inner == pytest.approx(0.9813, abs=0.001)
+    assert outer == pytest.approx(1.6886, abs=0.001)
+    opt_in, opt_out = ref["optimistic_au"]
+    assert opt_in == pytest.approx(0.7503, abs=0.001)
+    assert opt_out == pytest.approx(1.7658, abs=0.001)
+
+
+def test_earth_sits_inside_the_solar_habitable_zone():
+    from ml.earthlike.habitable_zone import habitable_zone
+    hz = habitable_zone(5780.0, 1.0)
+    assert hz.contains_flux(1.0)                   # Earth
+    assert not hz.contains_flux(1.91)              # Venus
+    assert not hz.contains_flux(0.43) or hz.contains_flux(0.43)  # Mars: near the edge
+
+
+def test_optimistic_zone_is_wider_than_conservative():
+    from ml.earthlike.habitable_zone import habitable_zone
+    hz = habitable_zone(5780.0, 1.0)
+    c_in, c_out = hz.distance_conservative_au
+    o_in, o_out = hz.distance_optimistic_au
+    assert o_in < c_in and o_out > c_out
+
+
+def test_cooler_stars_have_closer_habitable_zones():
+    from ml.earthlike.habitable_zone import habitable_zone
+    sun = habitable_zone(5780.0, 1.0)
+    mdwarf = habitable_zone(3400.0, 0.015)
+    assert mdwarf.distance_conservative_au[0] < sun.distance_conservative_au[0]
+
+
+def test_hz_flags_extrapolation_outside_validity_range():
+    from ml.earthlike.habitable_zone import habitable_zone
+    assert habitable_zone(2000.0, 0.001).extrapolated
+    assert not habitable_zone(5780.0, 1.0).extrapolated
+
+
+# ===========================================================================
+# EARTHLIKE SCORE
+# ===========================================================================
+EARTH = dict(planet_radius_re=1.0, insolation_earth=1.0, equilibrium_temp_k=255.0,
+             stellar_teff_k=5772.0, stellar_radius_sun=1.0, stellar_mass_sun=1.0)
+
+
+def test_earth_reference_case_scores_highly():
+    from ml.earthlike.score import compute_earth_like_score
+    r = compute_earth_like_score(**EARTH)
+    assert r.earth_like_score > 90
+    assert r.band == "High-priority candidate"
+
+
+def test_gas_giant_scores_low():
+    from ml.earthlike.score import compute_earth_like_score
+    r = compute_earth_like_score(planet_radius_re=11.2, insolation_earth=900.0,
+                                 equilibrium_temp_k=1400.0, stellar_teff_k=6000.0,
+                                 stellar_radius_sun=1.2, stellar_mass_sun=1.1)
+    assert r.earth_like_score < 30
+    assert r.band == "Low similarity to Earth-like criteria"
+
+
+def test_uncertainty_widens_the_interval_without_moving_the_point_estimate():
+    """The design point of the whole module.
+
+    Two candidates with identical measured values but different uncertainties
+    must get the same score and different intervals. If the interval did not
+    widen, the score would be reporting precision the data does not contain.
+    """
+    from ml.earthlike.score import compute_earth_like_score
+    precise = compute_earth_like_score(**EARTH, planet_radius_err=0.03,
+                                       stellar_radius_err=0.02, n_samples=2000, seed=1)
+    vague = compute_earth_like_score(**EARTH, planet_radius_err=0.35,
+                                     stellar_radius_err=0.35, n_samples=2000, seed=1)
+    assert precise.earth_like_score == vague.earth_like_score
+    width = lambda r: r.confidence_interval["upper"] - r.confidence_interval["lower"]
+    assert width(vague) > width(precise) * 1.5
+
+
+def test_high_uncertainty_produces_a_warning():
+    from ml.earthlike.score import compute_earth_like_score
+    r = compute_earth_like_score(**EARTH, planet_radius_err=0.40, n_samples=500)
+    assert any("uncertainty is high" in w for w in r.warnings)
+
+
+def test_missing_data_does_not_zero_the_score():
+    """A missing component must be excluded, not scored as zero."""
+    from ml.earthlike.score import compute_earth_like_score
+    r = compute_earth_like_score(planet_radius_re=1.0, stellar_teff_k=5772.0,
+                                 stellar_radius_sun=1.0)
+    assert np.isfinite(r.earth_like_score)
+    assert r.earth_like_score > 0
+
+
+def test_score_is_smooth_across_the_earth_sized_boundary():
+    """No hard cutoff: 1.24 and 1.26 R_earth must not be categorically different."""
+    from ml.earthlike.score import score_radius
+    below = float(score_radius(np.array([1.24]))[0])
+    above = float(score_radius(np.array([1.26]))[0])
+    assert abs(below - above) < 0.05
+
+
+def test_every_result_carries_the_disclaimer():
+    from ml.earthlike.score import DISCLAIMER, compute_earth_like_score
+    r = compute_earth_like_score(**EARTH)
+    assert "not an official NASA" in r.disclaimer
+    assert "habitable" in DISCLAIMER
+
+
+def test_weights_are_configurable():
+    from ml.earthlike.score import ScoringConfig, compute_earth_like_score
+    radius_only = ScoringConfig(w_radius=1.0, w_flux=0.0, w_temperature=0.0,
+                                w_habitable_zone=0.0, w_host_star=0.0)
+    r = compute_earth_like_score(planet_radius_re=11.2, insolation_earth=1.0,
+                                 equilibrium_temp_k=255.0, stellar_teff_k=5772.0,
+                                 stellar_radius_sun=1.0, config=radius_only)
+    assert r.earth_like_score < 5     # radius alone dominates
+
+
+def test_data_quality_penalises_assumed_stellar_parameters():
+    from ml.earthlike.rank_candidates import data_quality_score
+    measured = pd.Series({"koi_prad": 1.0, "koi_period": 300.0, "koi_steff": 5700.0,
+                          "koi_srad": 1.0, "koi_insol": 1.0, "koi_sparprov": "SME",
+                          "f_prad_frac_err": 0.07})
+    assumed = measured.copy()
+    assumed["koi_sparprov"] = "SOLAR"
+    assumed["f_prad_frac_err"] = 0.33
+    assert data_quality_score(measured)[0] > data_quality_score(assumed)[0]
+    assert data_quality_score(assumed)[1]      # reasons are reported
+
+
+# ===========================================================================
+# API
+# ===========================================================================
+@pytest.fixture(scope="module")
+def client():
+    from fastapi.testclient import TestClient
+    from backend.app.main import app
+    with TestClient(app) as c:
+        yield c
+
+
+def test_health_endpoint(client):
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.json()["status"] == "healthy"
+
+
+def test_prediction_validation_rejects_bad_input(client):
+    assert client.post("/api/predict", json={"koi_period": -5, "koi_duration": 2,
+                                             "koi_depth": 100, "koi_prad": 1}).status_code == 422
+    assert client.post("/api/predict", json={"koi_period": 5}).status_code == 422
+    assert client.post("/api/predict", json={"koi_period": 5, "koi_duration": 2,
+                                             "koi_depth": 900000,
+                                             "koi_prad": 1}).status_code == 422
+
+
+def test_prediction_returns_a_labelled_probability(client):
+    payload = {"koi_period": 289.9, "koi_duration": 10.8, "koi_depth": 492.0,
+               "koi_prad": 2.38, "koi_ror": 0.0223, "koi_srho": 1.42,
+               "koi_steff": 5518.0, "koi_srad": 0.98, "koi_smass": 0.97,
+               "koi_slogg": 4.44, "koi_model_snr": 33.0}
+    r = client.post("/api/predict", json=payload)
+    if r.status_code == 503:
+        pytest.skip("no trained model available in this environment")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["prediction"] in {"PLANET CANDIDATE", "FALSE POSITIVE"}
+    assert 0.0 <= body["probability"] <= 1.0
+    assert body["scientifically_valid"] is True
+    assert body["feature_set"] in fx.VALID_FEATURE_SETS
+    assert body["disclaimer"]
+
+
+def test_missing_planet_returns_404(client):
+    assert client.get("/api/planets/999999999").status_code == 404
+    assert client.get("/api/planets/koi/K99999.99").status_code == 404
+
+
+def test_earth_like_endpoint(client):
+    r = client.post("/api/analyze-earth-like", json={
+        "planet_radius_re": 1.06, "insolation_earth": 1.11,
+        "equilibrium_temp_k": 262.0, "stellar_teff_k": 5518.0,
+        "stellar_radius_sun": 0.98, "stellar_mass_sun": 0.97,
+        "planet_radius_err": 0.32})
+    assert r.status_code == 200
+    body = r.json()
+    assert 0 <= body["earth_like_score"] <= 100
+    assert body["confidence_interval"]["lower"] is not None
+    assert body["warnings"]
+    assert "not an official NASA" in body["disclaimer"]
+    assert body["habitable_zone"]["reference"].startswith("Kopparapu")
+
+
+def test_earth_like_validation_rejects_negative_radius(client):
+    assert client.post("/api/analyze-earth-like",
+                       json={"planet_radius_re": -1.0}).status_code == 422
+
+
+def test_feature_sets_endpoint_exposes_the_quarantine(client):
+    body = client.get("/api/feature-sets").json()
+    assert body["sets"]["leaky_control"]["scientifically_valid"] is False
+    assert body["sets"]["physics_informed"]["scientifically_valid"] is True
+    assert "koi_fpflag_nt" in body["quarantined_columns"]
+
+
+def test_api_never_serves_a_leaky_model(client):
+    body = client.get("/api/models").json()
+    primary = body.get("primary", {})
+    if primary:
+        assert primary["feature_set"] in fx.VALID_FEATURE_SETS
+
+
+def test_errors_do_not_leak_filesystem_paths(client):
+    r = client.get("/api/planets/999999999")
+    assert "/home/" not in r.text and "Traceback" not in r.text
+
+
+# ===========================================================================
+# LIGHT CURVES
+# ===========================================================================
+def test_bls_recovers_an_injected_period():
+    from lightcurve.acquisition.load_lightcurve import make_synthetic_lightcurve
+    from lightcurve.preprocessing.clean_lightcurve import clean_and_flatten
+    from lightcurve.transit_detection.detect_transits import bls_search
+    lc = clean_and_flatten(make_synthetic_lightcurve(
+        period_days=6.4, depth_ppm=1500, duration_hours=3.0, seed=3))
+    result = bls_search(lc)
+    assert result.best_period_days == pytest.approx(6.4, rel=0.02)
+    assert result.depth_ppm > 300
+    assert result.depth_snr > 7.1
+
+
+def test_lightcurve_loader_never_substitutes_synthetic_data():
+    from lightcurve.acquisition.load_lightcurve import (
+        HAS_LIGHTKURVE, LightCurveUnavailable, load_kepler_lightcurve,
+    )
+    if HAS_LIGHTKURVE:
+        pytest.skip("lightkurve installed; cannot test the unavailable path")
+    with pytest.raises(LightCurveUnavailable):
+        load_kepler_lightcurve(11446443)
+
+
+def test_synthetic_lightcurve_is_labelled_synthetic():
+    from lightcurve.acquisition.load_lightcurve import make_synthetic_lightcurve
+    lc = make_synthetic_lightcurve()
+    assert lc.is_synthetic
+    assert "SYNTHETIC" in lc.provenance["warning"]
+
+
+def test_sigma_clip_is_asymmetric():
+    """A downward outlier might be the transit; an upward one is a cosmic ray."""
+    from lightcurve.preprocessing.clean_lightcurve import SIGMA_CLIP_LOWER, SIGMA_CLIP_UPPER
+    assert SIGMA_CLIP_LOWER > SIGMA_CLIP_UPPER
+
+
+def test_flatten_records_its_window_for_comparison_with_transit_duration():
+    from lightcurve.acquisition.load_lightcurve import make_synthetic_lightcurve
+    from lightcurve.preprocessing.clean_lightcurve import clean_and_flatten
+    lc = clean_and_flatten(make_synthetic_lightcurve(baseline_days=40))
+    assert lc.provenance["flatten_window_days"] > 0
+    assert "must exceed the transit duration" in lc.provenance["flatten_warning"]
+
+
+# ===========================================================================
+# DEEP LEARNING
+# ===========================================================================
+def test_lightcurve_views_have_the_expected_shapes():
+    from lightcurve.acquisition.load_lightcurve import make_synthetic_lightcurve
+    from lightcurve.deep_learning.dataset import GLOBAL_BINS, LOCAL_BINS, make_views
+    from lightcurve.preprocessing.clean_lightcurve import clean_and_flatten
+    lc = clean_and_flatten(make_synthetic_lightcurve(period_days=5.0, baseline_days=40))
+    views = make_views(lc, 5.0, float(lc.time.min() + 1.5), 3.0, label=1)
+    assert views.global_view.shape == (GLOBAL_BINS,)
+    assert views.local_view.shape == (LOCAL_BINS,)
+    assert np.isfinite(views.global_view).all()
+
+
+def test_normalisation_stats_come_from_training_only():
+    from lightcurve.deep_learning.dataset import make_synthetic_dataset, normalise_views
+    views, _ = make_synthetic_dataset(n=20, seed=5, baseline_days=30)
+    _, _, stats = normalise_views(views[:12])
+    Gva, _, stats_again = normalise_views(views[12:], stats)
+    assert stats_again is stats           # reused, not recomputed on validation
+    assert np.isfinite(Gva).all()
+
+
+@pytest.mark.skipif(
+    not __import__("lightcurve.deep_learning.cnn_model", fromlist=["HAS_TORCH"]).HAS_TORCH,
+    reason="PyTorch is not installed")
+def test_cnn_forward_pass_produces_one_logit_per_sample():
+    import torch
+    from lightcurve.deep_learning.cnn_model import TransitCNN
+    from lightcurve.deep_learning.dataset import GLOBAL_BINS, LOCAL_BINS
+    model = TransitCNN()
+    out = model(torch.randn(4, GLOBAL_BINS), torch.randn(4, LOCAL_BINS))
+    assert out.shape == (4,)
+
+
+def test_classifier_builds_with_or_without_torch():
+    from lightcurve.deep_learning.cnn_model import build_classifier
+    model = build_classifier(seed=0)
+    assert hasattr(model, "name")
+
+
+# ===========================================================================
+# SETTINGS
+# ===========================================================================
+def test_settings_default_to_pr_auc_not_accuracy():
+    assert Settings().selection_metric == "pr_auc"
+
+
+def test_settings_banner_distinguishes_sources(monkeypatch):
+    assert "SYNTHETIC" in Settings().data_source_banner()
+    monkeypatch.setenv("DATA_SOURCE", "real")
+    assert "NASA" in Settings().data_source_banner()

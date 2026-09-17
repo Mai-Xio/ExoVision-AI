@@ -1,0 +1,83 @@
+{
+  "dataset": "koi_training_data.csv",
+  "rows": 3811,
+  "training_rows": 3049,
+  "test_rows": 762,
+  "physics_features_original": 38,
+  "physics_features_final": 35,
+  "removed_constant_features": [
+    "f_insol_ratio",
+    "f_teq_ratio",
+    "f_period_frac_err"
+  ],
+  "group_column": "kepid",
+  "target_column": "target_binary",
+  "split_column": "split",
+  "training_unique_hosts": 2260,
+  "test_unique_hosts": 562,
+  "shared_hosts": 0,
+  "cv": {
+    "type": "StratifiedGroupKFold",
+    "n_splits": 5,
+    "shuffle": true,
+    "random_state": 42
+  },
+  "models": {
+    "random_forest": {
+      "n_estimators": 500,
+      "class_weight": "balanced",
+      "max_features": "sqrt",
+      "random_state": 42
+    },
+    "gradient_boosting": {
+      "n_estimators": 300,
+      "learning_rate": 0.05,
+      "max_depth": 3,
+      "random_state": 42
+    }
+  },
+  "rf_cv_mean": {
+    "accuracy": 0.9698311779268686,
+    "precision": 0.9610664986884103,
+    "recall": 0.9834072675790468,
+    "f1": 0.9720853861748342,
+    "roc_auc": 0.9920842986018578,
+    "pr_auc": 0.9914584942569469,
+    "balanced_accuracy": 0.968852138855004,
+    "mcc": 0.9396239361411386,
+    "brier": 0.024199667558442384
+  },
+  "gb_cv_mean": {
+    "accuracy": 0.9681875302091075,
+    "precision": 0.9615474606204785,
+    "recall": 0.9797187352524777,
+    "f1": 0.9704940987875379,
+    "roc_auc": 0.9920922542849222,
+    "pr_auc": 0.9917465799315701,
+    "balanced_accuracy": 0.9673587498847018,
+    "mcc": 0.9363104652655153,
+    "brier": 0.025396300867309936
+  },
+  "rf_test": {
+    "accuracy": 0.968503937007874,
+    "precision": 0.9614457831325302,
+    "recall": 0.9803439803439803,
+    "f1": 0.9708029197080292,
+    "roc_auc": 0.995293629096446,
+    "pr_auc": 0.9955215042327358,
+    "balanced_accuracy": 0.9676367789043845,
+    "mcc": 0.9368309962084467,
+    "brier": 0.02350638320209974
+  },
+  "gb_test": {
+    "accuracy": 0.9671916010498688,
+    "precision": 0.961352657004831,
+    "recall": 0.9778869778869779,
+    "f1": 0.9695493300852619,
+    "roc_auc": 0.9951967332249022,
+    "pr_auc": 0.9957115373257166,
+    "balanced_accuracy": 0.9664082776758833,
+    "mcc": 0.9341526148862567,
+    "brier": 0.026342880733627273
+  }
+}

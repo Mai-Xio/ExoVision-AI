@@ -1,0 +1,73 @@
+# ExoVision AI — local stack.
+#
+#   docker compose up --build            backend + postgres + frontend
+#   docker compose run --rm pipeline     build the dataset, train, rank candidates
+#
+# Secrets come from .env (git-ignored). See .env.example.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-exovision}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-exovision}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-exovision}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-exovision}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-exovision}
+      DATA_SOURCE: ${DATA_SOURCE:-synthetic}
+      ARTIFACTS_DIR: /app/artifacts
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:3000}
+      MC_SAMPLES_FAST: ${MC_SAMPLES_FAST:-200}
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./ml/data:/app/ml/data
+    ports:
+      - "8000:8000"
+
+  # One-shot pipeline runner. Shares the artifacts volume with the backend, so
+  # models trained here are what the API serves on its next start.
+  pipeline:
+    build: .
+    profiles: ["pipeline"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-exovision}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-exovision}
+      DATA_SOURCE: ${DATA_SOURCE:-synthetic}
+      ARTIFACTS_DIR: /app/artifacts
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./ml/data:/app/ml/data
+    command: >
+      sh -c "python -m ml.preprocessing.build_dataset &&
+             python -m ml.training.train --include-leaky &&
+             python -m ml.evaluation.compare_models &&
+             python -m ml.earthlike.rank_candidates &&
+             python -m backend.app.database.ingest"
+
+  frontend:
+    build: ./frontend
+    profiles: ["ui"]
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+
+volumes:
+  pgdata:

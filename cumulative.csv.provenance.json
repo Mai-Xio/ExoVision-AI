@@ -1,0 +1,10 @@
+{
+  "source": "SYNTHETIC GENERATOR \u2014 ml.data_access.synthetic_data_loader",
+  "warning": "NOT NASA data. Generated for offline development and testing.",
+  "generator_seed": 42,
+  "n_requested": 4000,
+  "retrieved_utc": "2026-09-16T14:37:11+00:00",
+  "n_rows": 3889,
+  "n_columns": 45,
+  "sha256": "b682ae555b8cc9c1468877f1dffff4908b71dc10ff9b19cb6beb25dcd0dcecce"
+}
